@@ -1,14 +1,104 @@
 package gokrazy
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 
+	diskfs "github.com/diskfs/go-diskfs"
 	"github.com/gokrazy/internal/rootdev"
 )
+
+const (
+	additionalDisksFile = "mount-disks.json"
+)
+
+type additionalDisks struct {
+	Disks []diskMount `json:"disks"`
+}
+
+type diskMount struct {
+	PartUUID   string `json:"partUUID"`
+	Type       string `json:"type"`
+	Mountpoint string `json:"mountpoint"`
+	Options    string `json:"options"`
+}
+
+func (d diskMount) validate() error {
+	if d.PartUUID == "" {
+		return errors.New("partUUID is needed to mount the disk")
+	}
+	if d.Type == "" {
+		return errors.New("type is needed to mount disk")
+	}
+	if d.Mountpoint == "" {
+		return errors.New("no mountpoint set")
+	}
+	return nil
+}
+
+func (d diskMount) mount() error {
+	path, err := findBlockDevice(d.PartUUID)
+	if err != nil {
+		return err
+	}
+	return syscall.Mount(path, d.Mountpoint, d.Type, 0, d.Options)
+}
+
+// findBlockDevice finds the block device for the given partition UUID
+func findBlockDevice(partUUID string) (string, error) {
+	logError := func(e error) {
+		log.Printf("error when searching for partition with ID %s: %v", partUUID, e)
+	}
+	var dev string
+	err := filepath.WalkDir("/sys/block", func(path string, info fs.DirEntry, err error) error {
+		if err != nil {
+			logError(err)
+			return nil
+		}
+		i, err := info.Info()
+		if err != nil {
+			logError(err)
+			return nil
+		}
+		// we are only interested in symlinks
+		if i.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		devname := filepath.Join("/dev", filepath.Base(path))
+		disk, err := diskfs.Open(devname, diskfs.WithOpenMode(diskfs.ReadOnly))
+		if err != nil {
+			logError(err)
+			return nil
+		}
+		partTable, err := disk.GetPartitionTable()
+		if err != nil {
+			logError(err)
+			return nil
+		}
+		for i, part := range partTable.GetPartitions() {
+			if strings.ToLower(part.UUID()) == strings.ToLower(partUUID) {
+				dev = fmt.Sprintf("%s%d", devname, i+1)
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if dev == "" {
+		return "", fmt.Errorf("could not find partition with UUID %s", partUUID)
+	}
+	return dev, nil
+}
 
 // mountCompat deals with old FAT root file systems, to cover the case where
 // users use an old gokr-packer with a new github.com/gokrazy/gokrazy package.
@@ -119,5 +209,31 @@ func mountfs() error {
 		log.Printf("cgroup2 on /sys/fs/cgroup: %v", err)
 	}
 
+	return nil
+}
+
+func mountAdditionalDisks() error {
+	data, err := os.ReadFile(filepath.Join("/perm", additionalDisksFile))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		// the file does not exist, so we don't need to mount anything
+		log.Println("No additional disks to mount")
+		return nil
+	}
+	extra := additionalDisks{}
+	if err := json.Unmarshal(data, &extra); err != nil {
+		return fmt.Errorf("can not parse %s: %w", additionalDisksFile, err)
+	}
+	for _, disk := range extra.Disks {
+		if err := disk.validate(); err != nil {
+			log.Printf("error when validating additonal disk entry: %v", err)
+			continue
+		}
+		if err := disk.mount(); err != nil {
+			return fmt.Errorf("can not mount disk with partUUID %s: %w", disk.PartUUID, err)
+		}
+	}
 	return nil
 }

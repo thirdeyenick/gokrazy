@@ -266,6 +266,12 @@ func Boot(userBuildTimestamp string) error {
 		log.Printf("creating compatibility symlink /dev/ttyAMA0 -> /dev/ttyS0 failed: %v", err)
 	}
 
+	if err := mountAdditionalDisks(); err != nil {
+		log.Printf("Could not mount additional disks: %v", err)
+		// wait a bit so the error message can be seen
+		time.Sleep(10 * time.Second)
+	}
+
 	if err := pollPowerButtons(); err != nil {
 		log.Printf("polling power buttons: %v", err)
 	}
